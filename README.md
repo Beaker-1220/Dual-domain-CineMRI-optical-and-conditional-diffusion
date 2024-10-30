@@ -1,1 +1,1 @@
-# Dual-domain-CineMRI-reconstruction-using-optical-and-conditional-diffusion
+# Dual-domain-CineMRI-using-optical-and-conditional-diffusion
