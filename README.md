@@ -7,3 +7,18 @@
 
    ### Model structure
 ![modell](https://github.com/user-attachments/assets/195c15f8-3f22-4ae9-b05b-bcb78cc05e82)
+
+## in master branch, flownet2 is used to calculate optical flow between to frame, and by running
+      fm.py 
+   to get the optical feature maps
+
+## Three parts of the model needed to be trained:
+### Unet for ddpm
+### transformer for optical features maps and origin images
+### transformer for dct images and images reconed above
+   
+
+### Run conditional diffusion to training Unet on dct transformed image:
+      python model.py
+
+the logic of adding the mask is in utils/mask_utils.py
