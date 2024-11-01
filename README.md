@@ -13,9 +13,9 @@
    to get the optical feature maps
 
 ## Three parts of the model needed to be trained:
-### Unet for ddpm
-### transformer for optical features maps and origin images
-### transformer for dct images and images reconed above
+1. Unet for ddpm
+2. transformer for optical features maps and origin images
+3. transformer for dct images and images reconed above
    
 
 ### Run conditional diffusion to training Unet on dct transformed image:
