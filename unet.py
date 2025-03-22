@@ -6,7 +6,7 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-
+from transformer import Transformer_dual
 from utils.fp16_util import convert_module_to_f16, convert_module_to_f32
 from nn import (
     checkpoint,
@@ -482,7 +482,7 @@ class UNetModel(nn.Module):
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
-
+        
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
             linear(model_channels, time_embed_dim),
@@ -679,7 +679,6 @@ class UNetModel(nn.Module):
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
         h = h.type(x.dtype)
-        # h = h.permute(0, 2, 3, 1)
         return self.out(h)
 
 

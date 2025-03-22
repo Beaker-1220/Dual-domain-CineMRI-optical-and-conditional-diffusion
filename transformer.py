@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
+    def __init__(self, d_model, dropout=0.1, max_len=400000):
         super(PositionalEncoding, self).__init__()
         self.dropout = nn.Dropout(p=dropout)
 
@@ -15,9 +15,16 @@ class PositionalEncoding(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         pe = pe.unsqueeze(0)
         self.register_buffer('pe', pe)
-
     def forward(self, x):
-        x = x + self.pe[:, :x.size(1)]
+        # 计算输入张量的序列长度
+        seq_len = x.size(1) * x.size(2)
+        
+        # 将位置编码扩展到与输入张量相同的批量大小
+        pe = self.pe[:, :seq_len].repeat(x.size(0), 1, 1)
+        x = x.reshape(x.size(0), x.size(1)*x.size(2), x.size(3))
+        
+        # 添加位置编码并应用dropout
+        x = x + pe
         return self.dropout(x)
 
 class MultiHeadAttention(nn.Module):
@@ -59,9 +66,9 @@ class TransformerEncoderLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
-    def forward(self, src, src_mask=None):
-        src2 = self.self_attn(src, src, src, attn_mask=src_mask)
-        src = self.norm1(src + src2)
+    def forward(self, q, k, v, src_mask=None):
+        src2 = self.self_attn(q, k, v, attn_mask=src_mask)
+        src = self.norm1(q + src2)
         src2 = self.linear2(self.dropout1(F.relu(self.linear1(src))))
         src = self.norm2(src + src2)
         return src
@@ -74,9 +81,9 @@ class TransformerEncoder(nn.Module):
         )
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, src, src_mask=None):
+    def forward(self, q, k, v, src_mask=None):
         for layer in self.layers:
-            src = layer(src, src_mask)
+            src = layer(q, k, v, src_mask)
         return self.norm(src)
 
 class Transformer(nn.Module):
@@ -85,20 +92,83 @@ class Transformer(nn.Module):
         self.encoder = TransformerEncoder(num_layers, d_model, nhead, dim_feedforward, dropout)
         self.embedding = nn.Linear(input_dim, d_model)
         self.positional_encoding = PositionalEncoding(d_model)
+        self.qkv_layer = MultiHeadAttention(d_model, nhead) # 添加qkv层
+        self.linear_layer = nn.Linear(d_model, input_dim)
 
     def forward(self, image, flow1, flow2):
+        
         # 对输入图像和光流特征图进行嵌入
         img_embedded = self.embedding(image)  # [batch_size, seq_length, d_model]
         flow1_embedded = self.embedding(flow1)  # [batch_size, seq_length, d_model]
-        flow2_embedded = self.embedding(flow2)  # [batch_size, seq_length, d_model]
-
-        # 将嵌入结果合并
-        combined = img_embedded + flow1_embedded + flow2_embedded  # 这里可以使用其他方式合并
-
-        # 添加位置编码
+        flow2_embedded = self.embedding(flow2)# [batch_size, seq_length, d_model]
+        # img_embedded = img_embedded.reshape(img_embedded.size(0), img_embedded.size(1)*img_embedded.size(2), img_embedded.size(3))
+        # flow1_embedded = flow1_embedded.reshape(flow1_embedded.size(0), flow1_embedded.size(1)*flow1_embedded.size(2), flow1_embedded.size(3))
+        # flow2_embedded = flow2_embedded.reshape(flow2_embedded.size(0), flow2_embedded.size(1)*flow2_embedded.size(2), flow2_embedded.size(3))
+        
+        # 对图像和光流特征图进行位置编码
+        q = img_embedded
+        k = torch.cat([flow1_embedded, flow2_embedded], dim=1)
+        v = img_embedded
+        combined = torch.cat([q, k, v], dim=1)  # [batch_size, 3*seq_length, d_model]
         combined = self.positional_encoding(combined)
+        # 假设 combined 的形状为 [batch_size, seq_length, d_model]
+        batch_size, total_length, d_model = combined.shape
+        q_length = total_length // 4
+        v_length = total_length // 4
+        k_length = total_length // 4
 
-        # Transformer 编码器
-        transformer_output = self.encoder(combined)
+        # 使用 torch.split 按照计算出的长度进行分割
+        q, k_0, k_1, v = torch.split(combined, [q_length, k_length, k_length, v_length], dim=1)
+        transformer_output = self.encoder(q, k_0, v)
+        transformer_output = self.encoder(transformer_output, k_1, transformer_output)
+        output = self.linear_layer(transformer_output)
 
-        return transformer_output
+        return output
+    
+class TransformerEncoder(nn.Module):
+    def __init__(self, num_layers, d_model, nhead, dim_feedforward, dropout=0.1):
+        super(TransformerEncoder, self).__init__()
+        self.layers = nn.ModuleList(
+            [TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout) for _ in range(num_layers)]
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, q, k, v, src_mask=None):
+        for layer in self.layers:
+            src = layer(q, k, v, src_mask)
+        return self.norm(src)
+
+class Transformer_dual(nn.Module):
+    def __init__(self, num_layers, d_model, nhead, dim_feedforward, input_dim, dropout=0.1):
+        super(Transformer_dual, self).__init__()
+        self.encoder = TransformerEncoder(num_layers, d_model, nhead, dim_feedforward, dropout)
+        self.embedding = nn.Linear(input_dim, d_model)
+        self.positional_encoding = PositionalEncoding(d_model)
+        self.qkv_layer = MultiHeadAttention(d_model, nhead) # 添加qkv层
+        self.linear_layer = nn.Linear(d_model, input_dim)
+
+    def forward(self, image, dct_image):
+        
+        # 对输入图像和光流特征图进行嵌入
+        img_embedded = self.embedding(image)  # [batch_size, seq_length, d_model]
+        dct_image = self.embedding(dct_image)  # [batch_size, seq_length, d_model]
+
+
+        # 对图像和光流特征图进行位置编码
+        q = img_embedded
+        k = dct_image
+        v = img_embedded
+        combined = torch.cat([q, k, v], dim=1)  # [batch_size, 3*seq_length, d_model]
+        combined = self.positional_encoding(combined)
+        # 假设 combined 的形状为 [batch_size, seq_length, d_model]
+        batch_size, total_length, d_model = combined.shape
+        q_length = total_length // 3
+        v_length = total_length // 3
+        k_length = total_length // 3
+
+        # 使用 torch.split 按照计算出的长度进行分割
+        q, k, v = torch.split(combined, [q_length, k_length, v_length], dim=1)
+        transformer_output = self.encoder(q, k, v)
+        output = self.linear_layer(transformer_output)
+
+        return output

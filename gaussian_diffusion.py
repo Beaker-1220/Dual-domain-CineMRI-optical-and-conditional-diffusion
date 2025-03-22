@@ -14,7 +14,7 @@ import torch as th
 from nn import mean_flat
 # from .losses import normal_kl, discretized_gaussian_log_likelihood
 from utils.dist_util import dev
-
+from modelzoo import dct_to_idct, transformer_dual, device
 
 # ytxie: This function is used in `get_named_alpha_beta_shedule`.
 # ytxie: It is only used for ddpm shedule.
@@ -261,7 +261,7 @@ class GaussianDiffusion:
         )
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_eps_std(self, model, x_t, t, model_kwargs=None):
+    def p_eps_std(self, model, x_t, flow_0, flow_1, t, model_kwargs=None):
         """
         Apply the model to compute "epsilon" item and std parameter in predictor or corrector.
 
@@ -275,7 +275,8 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
         assert t.shape == (x_t.shape[0], )
-        model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+        model_output = model(x_t, flow_0, flow_1)
+        model_output = model_output.reshape(x_t.shape)
         model_var_values = None
 
         if self.model_mean_type == ModelMeanType.EPSILON:
@@ -309,10 +310,10 @@ class GaussianDiffusion:
             std = th.exp(0.5 * model_log_variance)
         else:
             raise NotImplementedError(self.model_var_type)
-
+        
         return eps, std
-
-    def ddpm_predictor(self, model, x_t, t, model_kwargs=None, clip=False):
+    
+    def ddpm_predictor(self, model, x_t, flow_0, flow_1, t, model_kwargs=None, clip=False):
         """
         DDPM-Predictor
 
@@ -326,7 +327,7 @@ class GaussianDiffusion:
         """
         assert self.sampling_kwargs is None, "in ddpm-predictor, no hyper-parameter"
 
-        eps, std = self.p_eps_std(model, x_t, t, model_kwargs=model_kwargs)
+        eps, std = self.p_eps_std(model, x_t, flow_0, flow_1, t, model_kwargs=model_kwargs)
 
         # compute model mean from model output
         pred_xstart = _extract_into_tensor(self.recip_bar_alphas, t, x_t.shape) * \
@@ -338,10 +339,82 @@ class GaussianDiffusion:
         noise = th.randn_like(x_t)
         nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x_t.shape) - 1)))  # no noise when t == 0
         sample = model_mean + nonzero_mask * std * noise
+        
 
         return sample
 
-    def ddim_predictor(self, model, x_t, t, model_kwargs=None, clip=False):
+    def ddpm(self, model, x_t, t, model_kwargs=None, clip=False):
+        """
+        DDPM-Predictor
+
+        :param model: the model to sample from.
+        :param x_t: the current tensor at x_t.
+        :param t: the value of t, starting at T for the first diffusion step.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to pass to the model.
+            This can be used for conditioning.
+        :param clip: if True, clip the x_start prediction to [-1, 1].
+        :return: a random sample from the model.
+        """
+        assert self.sampling_kwargs is None, "in ddpm-predictor, no hyper-parameter"
+
+        eps = model(x_t, t, model_kwargs)
+        std = _extract_into_tensor(self.betas, t, x_t.shape)
+        # compute model mean from model output
+        pred_xstart = _extract_into_tensor(self.recip_bar_alphas, t, x_t.shape) * \
+                      (x_t - _extract_into_tensor(self.bar_betas, t, x_t.shape) * eps)
+        pred_xstart = self._clip(pred_xstart, clip=clip)
+        model_mean, _, _ = self.q_posterior_mean_variance(x_start=pred_xstart, x_t=x_t, t=t)
+
+        # compute one sample of x_{t-1}
+        noise = th.randn_like(x_t)
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x_t.shape) - 1)))  # no noise when t == 0
+        sample = model_mean + nonzero_mask * std * noise
+        
+
+        return sample
+    
+    def ddim_predictor(self, model, x_t, flow_0, flow_1, t, model_kwargs=None, clip=False):
+        """
+        DDIM-Predictor
+
+        :param model: the model to sample from.
+        :param x_t: the current tensor at x_t.
+        :param t: the value of t, starting at T for the first diffusion step.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to pass to the model.
+            This can be used for conditioning.
+        :param clip: if True, clip the x_start prediction to [-1, 1].
+        :return: a random sample from the model.
+        """
+        if self.sampling_kwargs is None:
+            eta = 0.0
+        else:
+            assert "eta" in self.sampling_kwargs.keys(), "in ddim-predictor, eta is a hyper-parameter"
+            eta = self.sampling_kwargs["eta"]
+
+        eps, std = self.p_eps_std(model, x_t, flow_0, flow_1, t, model_kwargs=model_kwargs)
+        
+        # compute model mean
+        pred_xstart = _extract_into_tensor(self.recip_bar_alphas, t, x_t.shape) * \
+                      (x_t - _extract_into_tensor(self.bar_betas, t, x_t.shape) * eps)
+        pred_xstart = self._clip(pred_xstart, clip=clip)
+
+        eps = (x_t - _extract_into_tensor(self.bar_alphas, t, x_t.shape) * pred_xstart) / \
+              _extract_into_tensor(self.bar_betas, t, x_t.shape)
+
+        # this code is according to guided-diffusion code
+        bar_alpha = _extract_into_tensor(self.bar_alphas_square, t, x_t.shape)
+        bar_alpha_prev = _extract_into_tensor(self.bar_alphas_square_prev, t, x_t.shape)
+        sigma = eta * th.sqrt((1 - bar_alpha_prev) / (1 - bar_alpha)) * th.sqrt(1 - bar_alpha / bar_alpha_prev)
+
+        mean_pred = pred_xstart * th.sqrt(bar_alpha_prev) + th.sqrt(1 - bar_alpha_prev - sigma ** 2) * eps
+
+        noise = th.randn_like(x_t)
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x_t.shape) - 1)))  # no noise when t == 0
+        sample = mean_pred + nonzero_mask * sigma * noise
+
+        return sample
+
+    def ddim(self, model, x_t, t, model_kwargs=None, clip=False):
         """
         DDIM-Predictor
 
@@ -381,8 +454,8 @@ class GaussianDiffusion:
         sample = mean_pred + nonzero_mask * sigma * noise
 
         return sample
-
-    def sample_loop(self, model, shape, model_kwargs=None, clip=False, noise=None):
+    
+    def sample_loop(self, model, shape, noise, flow_0, flow_1, model_kwargs=None, clip=False):
         """
         Generate samples from the model.
 
@@ -398,34 +471,19 @@ class GaussianDiffusion:
         assert isinstance(shape, (tuple, list))
         if noise is not None:
             img = noise
-        elif self.diffusion_type == DiffusionType.DDPM:
-            img = th.randn(*shape, device=device)
-        elif self.diffusion_type == DiffusionType.SCORE:
-            assert False, "code fo score-based model has not been completed"
         else:
-            raise NotImplementedError(self.diffusion_type)
+            img = th.randn(*shape, device=device)
+        # elif self.diffusion_type == DiffusionType.DDPM:
+        #     img = th.randn(*shape, device=device)
+
         indices = list(range(self.num_timesteps))[::-1]
 
-        if self.predictor_type == PredictorType.DDPM:
-            predictor = self.ddpm_predictor
-        elif self.predictor_type == PredictorType.DDIM:
-            predictor = self.ddim_predictor
-        elif self.predictor_type == PredictorType.SDE:
-            assert False, "code of sde-predictor has not been completed"
-        else:
-            raise NotImplementedError(self.predictor_type)
-
-        if self.corrector_type == CorrectorType.LANGEVIN:
-            assert False, "code of langevin-corrector has not been completed"
-        elif self.corrector_type == CorrectorType.NONE:
-            corrector = None
-        else:
-            raise NotImplementedError(self.corrector_type)
-
+        corrector = None
+        predictor = self.ddim_predictor
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
             with th.no_grad():
-                img = predictor(model, img, t, model_kwargs=model_kwargs, clip=clip)
+                img = predictor(model, img, flow_0, flow_1, t, model_kwargs=model_kwargs, clip=clip)
                 if corrector is not None:
                     assert False, "code of corrector has not been completed"
 

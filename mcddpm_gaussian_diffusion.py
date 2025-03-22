@@ -181,7 +181,7 @@ class KspaceGaussianDiffusion(GaussianDiffusion):
         #     raise NotImplementedError(self.corrector_type)
 
         # we change variable name `img` to `kspace_c`
-        predictor = self.ddpm_predictor
+        predictor = self.ddpm
         corrector = None
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)

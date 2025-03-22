@@ -1,70 +1,159 @@
 import os
 import torch.nn as nn
 from PIL import Image
+import torchvision.transforms as T
 from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
+import yaml
 from gaussian_diffusion import DiffusionType,CorrectorType,PredictorType,ModelMeanType,ModelVarType,LossType
 from gaussian_diffusion import GaussianDiffusion
 import torch
 from scipy.fftpack import dct, idct
-from transformer import Transformer
+from transformer import Transformer,Transformer_dual
 from utils.mri_data_utils.mask_util import create_mask_for_mask_type
 from mcddpm_gaussian_diffusion import KspaceGaussianDiffusion
 import matplotlib.pyplot as plt
 import torch.optim as optim
+from transformer import TransformerEncoder
 from tqdm import tqdm
 import torchmetrics
 from unet import UNetModel
 from pytorch_msssim import ssim
+import torch as th
 from skimage.metrics import peak_signal_noise_ratio as compare_psnr
 from skimage.metrics import structural_similarity as compare_ssim
 from skimage.metrics import mean_squared_error as compare_mse
 import torch.nn.functional as F
 from torchvision.utils import save_image
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+from autoencoder import AutoencoderKL
+
+def visualize_mask(mask_tensor, idx=0, save_path=None):
+    """
+    将 mask_tensor 中的第 idx 张 mask 可视化或保存。
+
+    :param mask_tensor: Tensor, 形状为 [batch_size, channels, height, width]
+    :param idx: int, batch 内要可视化的第几张 mask
+    :param save_path: str, 如果提供路径，将图像保存到指定路径
+    """
+    mask_image = mask_tensor[idx].detach().cpu()  # 选择第 idx 个 mask, 并移动到 CPU
+    mask_image = T.ToPILImage()(mask_image)  # 将张量转换为 PIL 图像
+    
+    if save_path:
+        mask_image.save(save_path)  # 保存图像
+        print(f"Mask saved at {save_path}")
+    else:
+        # 显示图像
+        plt.imshow(mask_image, cmap="gray")
+        plt.axis("off")
+        plt.show()
+
+
 
 # DCT 到 IDCT
+def save_denoised_images(images, output_dir, epoch, batch_idx):
+    """
+    保存去噪后的图像到指定目录。
+    
+    :param images: 一个 [batch, channels, height, width] 形状的 tensor，包含去噪后的图像。
+    :param output_dir: 字符串，表示要保存图像的输出目录。
+    :param epoch: 当前的 epoch 数，用于生成文件名。
+    :param batch_idx: 当前 batch 的索引，用于生成文件名。
+    """
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 遍历 batch 中的每个图像并保存
+    for idx, img in enumerate(images):
+        # 将图像数据范围调整到 [0, 1]（若已归一化可跳过此步）
+        img = (img - img.min()) / (img.max() - img.min())
+        
+        # 设置文件路径
+        file_path = os.path.join(output_dir, f"denoised_image_epoch{epoch}_batch{batch_idx}_img{idx}.png")
+        
+        # 保存图像
+        save_image(img, file_path)
+        # print(f"Saved {file_path}")
+        
 def dct_to_idct(dct_tensor):
     # 转换为 NumPy 数组
-    dct_array = dct_tensor.numpy()
+    dct_array = dct_tensor.cpu().detach().numpy()
 
     # 执行 IDCT
-    idct_array = idct(dct_array, type=2, norm='ortho', axis=(-2, -1), overwrite_x=True)
+    # 对每个通道执行 IDCT 变换
+    idct_channels = []
+    for channel in range(dct_array.shape[2]):  # 遍历每个 RGB 通道
+        # 对行和列分别执行 IDCT 变换 (二维 IDCT)
+        idct_channel = idct(idct(dct_array[:, :, channel].T, norm='ortho').T, norm='ortho')
+        idct_channels.append(idct_channel)
+
+    # 将 IDCT 变换后的各通道堆叠成 numpy 数组
+    idct_image_np = np.stack(idct_channels, axis=-1)
 
     # 转换回 PyTorch 张量
-    return torch.tensor(idct_array)
+    return torch.tensor(idct_image_np)
 
 # 转换为图像并计算指标
 def compute_metrics(original_tensor, dct_tensor):
     # 执行 IDCT
     idct_tensor = dct_to_idct(dct_tensor)
+    original_tensor = dct_to_idct(original_tensor)
 
     # 确保范围在 [0, 1]
     idct_tensor = idct_tensor.clamp(0, 1)
+    original_tensor = original_tensor.clamp(0, 1)
+
 
     # 将张量转换为 NumPy 数组并转换为 [H, W, C] 格式
-    original_images = original_tensor.permute(0, 2, 3, 1).numpy()  # 原始图像
-    reconstructed_images = idct_tensor.permute(0, 2, 3, 1).numpy()  # 重建图像
-
+    original_images = original_tensor.cpu().detach().numpy()  # 原始图像
+    reconstructed_images = idct_tensor.cpu().detach().numpy() # 重建图像
     # 计算 PSNR 和 SSIM
     psnr_values = []
     ssim_values = []
+    mse_values = []
     for orig, recon in zip(original_images, reconstructed_images):
         # 计算 PSNR
-        psnr_value = torchmetrics.functional.psnr(torch.tensor(recon), torch.tensor(orig), data_range=1.0)
+        psnr_value = torchmetrics.functional.psnr(torch.tensor(orig), torch.tensor(recon), data_range=1.0)
         psnr_values.append(psnr_value.item())
-
         # 计算 SSIM
-        ssim_value = compare_ssim(orig, recon, multichannel=True)
+        ssim_value = compare_ssim(orig, recon,channel_axis=0, data_range=1.0)
         ssim_values.append(ssim_value)
+        
+        mse_value = compare_mse(orig, recon)
+        mse_values.append(mse_value)
 
-    return psnr_values, ssim_values
+    return psnr_values, ssim_values, mse_values
 
-class PixelDataset(Dataset):
+class ppDataset(Dataset):
     def __init__(self, root_dir, transform=None):
-        self.train_dir = os.path.join(root_dir)
-
-        self.train_images = sorted(os.listdir(self.train_dir))
+        self.train_dir = os.path.join(root_dir, 'train/input')
+        self.train_dir_tar = os.path.join(root_dir, 'train/target')
+        self.optical_dir = os.path.join(root_dir, 'feature_maps')
+        # self.train_images = sorted(os.listdir(self.train_dir))
+        # self.train_images_tar = sorted(os.listdir(self.train_dir_tar))
+        # self.optical_images = sorted(os.listdir(self.optical_dir))
         # assert len(self.train_images) == len(self.target_images), "Train and Target folders must have the same number of images."
+        self.train_images = []
+        self.train_images_tar = []
+        self.optical_images_0 = []
+        self.optical_images_1 = []
+
+        # 搜索文件夹并构建数据集
+        for filename in os.listdir(self.train_dir):
+            base_name = os.path.splitext(filename)[0]  # 去掉扩展名
+            # 构建需要查找的文件名
+            file_0 = f"{base_name}_0.png"  # 假设文件扩展名是 .png
+            file_1 = f"{base_name}_1.png"
+
+            if file_0 in os.listdir(self.optical_dir) and file_1 in os.listdir(self.optical_dir):
+                self.train_images.append(filename)  # 原始图像
+                self.train_images_tar.append(filename)  # GT
+                self.optical_images_0.append(file_0)  
+                self.optical_images_1.append(file_1)# flow1 and flow0
+
+        # assert len(self.train_images) == len(self.train_images_tar), "Train and Target folders must have the same number of images."
+
 
     def __len__(self):
         return len(self.train_images)
@@ -72,7 +161,10 @@ class PixelDataset(Dataset):
     def __getitem__(self, idx):
         # 获取训练图像和目标图像的路径
         train_img_path = os.path.join(self.train_dir, self.train_images[idx])
-
+        train_img_tar_path = os.path.join(self.train_dir_tar, self.train_images_tar[idx])
+        optical_img_0path = os.path.join(self.optical_dir, self.optical_images_0[idx])
+        optical_img_1path = os.path.join(self.optical_dir, self.optical_images_1[idx])
+        
         # 打开图像并转换为RGB格式（如果需要）
         train_img = Image.open(train_img_path).convert("RGB")
         train_img = train_img.resize((204, 448))
@@ -80,7 +172,47 @@ class PixelDataset(Dataset):
         train_data = train_data.astype(np.float32)  # 转换为 float32
         train_img = torch.tensor(train_data).permute(0, 1, 2)  # 改变形状为 [C, H, W]
 
-        return train_img
+        train_img_tar = Image.open(train_img_tar_path).convert("RGB")
+        train_img_tar = train_img_tar.resize((204, 448))
+        train_data_tar = np.array(train_img_tar) / 255.0  # 归一化到 [0, 1]
+        train_data_tar = train_data_tar.astype(np.float32)  # 转换为 float32
+        train_img_tar = torch.tensor(train_data_tar).permute(0, 1, 2)  # 改变形状为 [C, H, W]
+        
+        flow_0 = Image.open(optical_img_0path).convert("RGB")
+        flow_0 = flow_0.resize((204, 448))
+        flow_0 = np.array(flow_0) / 255.0  # 归一化到 [0, 1]
+        flow_0 = flow_0.astype(np.float32)  # 转换为 float32
+        flow_0 = torch.tensor(flow_0).permute(0, 1, 2)  # 改变形状为 [C, H, W]
+
+        flow_1 = Image.open(optical_img_1path).convert("RGB")
+        flow_1 = flow_1.resize((204, 448))
+        flow_1 = np.array(flow_1) / 255.0  # 归一化到 [0, 1]
+        flow_1 = flow_1.astype(np.float32)  # 转换为 float32
+        flow_1 = torch.tensor(flow_1).permute(0, 1, 2)  # 改变形状为 [C, H, W]
+        
+        # 对每个通道进行DCT变换
+        dct_channels = []
+        for channel in range(train_data.shape[2]):  # 针对每个RGB通道分别做DCT
+            # 对行和列分别进行DCT变换 (二维DCT)
+            dct_channel = dct(dct(train_data[:, :, channel].T, norm='ortho').T, norm='ortho')
+            dct_channels.append(dct_channel)
+
+        # 将DCT变换后的各通道堆叠为numpy数组，并转换为张量
+        dct_image = np.stack(dct_channels, axis=-1)
+        dct_image = torch.tensor(dct_image).permute(0, 1, 2)  # 改变形状为 [C, H, W]
+
+        dct_channels = []
+        for channel in range(train_data.shape[2]):  # 针对每个RGB通道分别做DCT
+            # 对行和列分别进行DCT变换 (二维DCT)
+            dct_channel = dct(dct(train_data_tar[:, :, channel].T, norm='ortho').T, norm='ortho')
+            dct_channels.append(dct_channel)
+
+        # 将DCT变换后的各通道堆叠为numpy数组，并转换为张量
+        dct_gt = np.stack(dct_channels, axis=-1)
+        dct_gt = torch.tensor(dct_gt).permute(0, 1, 2)  # 改变形状为 [C, H, W]
+
+
+        return train_img, train_img_tar, flow_0, flow_1, dct_image, dct_gt
 
 
 
@@ -102,12 +234,12 @@ class dctDataset(Dataset):
 
         # 打开图像并转换为RGB格式（如果需要）
         train_img = Image.open(train_img_path).convert("RGB")
-        train_img = train_img.resize((192, 448))
+        train_img = train_img.resize((64, 64))
         train_data = np.array(train_img) / 255.0  # 归一化到 [0, 1]
         train_data = train_data.astype(np.float32)  # 转换为 float32
 
         train_img_tar = Image.open(train_img_tar_path).convert("RGB")
-        train_img_tar = train_img_tar.resize((192, 448))
+        train_img_tar = train_img_tar.resize((64, 64))
         train_data_tar = np.array(train_img_tar) / 255.0  # 归一化到 [0, 1]
         train_data_tar = train_data_tar.astype(np.float32)  # 转换为 float32
 
@@ -148,6 +280,8 @@ def compute_ddpm_linear_alpha_beta(num_diffusion_timesteps):
 
     return alpha, beta
  # Create the dataset
+ 
+ 
 ACC4 = {
     "mask_type": "random",
     "center_fractions": [0.08],
@@ -158,7 +292,7 @@ mask_fun = create_mask_for_mask_type("random", [0.08],  [4])
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 示例用法
-num_timesteps = 200
+num_timesteps = 200  # 时间步数
 alpha, beta = compute_ddpm_linear_alpha_beta(num_timesteps)
 model = KspaceGaussianDiffusion(
     beta_scale=0.8,
@@ -171,28 +305,84 @@ model = KspaceGaussianDiffusion(
     corrector_type=None,  # 如果没有使用校正器，可以传入 None
     loss_type=LossType.MSE
 )
-batch_size = 1  # or use config.data.params.batch_size
-dataset_dct = dctDataset(root_dir='/root/autodl-tmp/.autodl/dataset1-70/train')
-dataloader_dct = DataLoader(dataset_dct, batch_size=batch_size, shuffle=True, num_workers=0, drop_last= True)
 
+model_ = GaussianDiffusion(
+    alphas=alpha,
+    betas=beta,
+    diffusion_type=DiffusionType.DDPM,
+    model_mean_type=ModelMeanType.EPSILON,
+    model_var_type=ModelVarType.DEFAULT,
+    predictor_type=PredictorType.DDPM,
+    corrector_type=None,  # 如果没有使用校正器，可以传入 None
+    loss_type=LossType.MSE
+)
+def _extract_into_tensor(arr, timesteps, broadcast_shape):
+    """
+    Extract values from a 1-D numpy array for a batch of indices.
+
+    :param arr: the 1-D numpy array.
+    :param timesteps: a tensor of indices into the array to extract.
+    :param broadcast_shape: a larger shape of K dimensions with the batch dimension equal to the length of timesteps.
+    :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
+    """
+    res = th.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
+    while len(res.shape) < len(broadcast_shape):
+        res = res[..., None]
+    return res.expand(broadcast_shape)
+#dataloader
+batch_size = 16  # or use config.data.params.batch_size
+dataset_dct = ppDataset(root_dir="/root/autodl-tmp/.autodl/dataset1-70")
+dataloader_dct = DataLoader(dataset_dct, batch_size=batch_size, shuffle=True, num_workers=8, drop_last= True)
 dct_dataset = dataloader_dct
-# # 使用示例
-# input_dim = 3  # 输入维度
-# output_dim = 3  # 输出维度
-# d_model = 256  # 特征维度
-# num_layers = 6  # 编码器/解码器层数
-# nhead = 8 # 注意力头数
-# dim_feedforward = 512  # 前馈网络维度
-# dropout = 0.1  # Dropout 概率
 
-# transformer_model = Transformer(num_layers, d_model, nhead, dim_feedforward, input_dim, output_dim, dropout).to(device)
+input_dim = 3  # 输入维度
+d_model = 256  # 特征维度
+num_layers = 6  # 编码器层数
+nhead = 4  # 注意力头数
+dim_feedforward = 512  # 前馈网络维度
+dropout = 0.1  # Dropout 概率
+
+
+# 读取YAML文件
+with open('config.yaml', 'r') as file:
+    config = yaml.safe_load(file)
+
+ddconfig = config['ddconfig']
+lossconfig = config['lossconfig']
+embed_dim = config['embed_dim']
+ignore_keys = config['ignore_keys']
+image_key = config['image_key']
+colorize_nlabels = config['colorize_nlabels']
+monitor = config['monitor'] 
+ckpt_path = '/root/latent-diffusion/logs/2024-10-14T17-59-13_autoencoder_kl_64x64x3/checkpoints/last.ckpt'
+
+
+
+autoencoder = AutoencoderKL(
+    ddconfig=ddconfig,
+    lossconfig=lossconfig,
+    embed_dim=embed_dim,
+    ckpt_path=ckpt_path,
+    ignore_keys=ignore_keys,
+    image_key=image_key,
+    colorize_nlabels=colorize_nlabels,
+    monitor=monitor
+)
+
+#models
+transformer = Transformer(num_layers, d_model, nhead, dim_feedforward, input_dim, dropout).to(device)
+transformer_dual = Transformer_dual(num_layers, d_model, nhead, dim_feedforward, input_dim, dropout).to(device)
 Unet = UNetModel(64, 3, 256, 3, 2, attention_resolutions = [32]).to(device)
-def train_denoising_model(data_loader = dct_dataset, num_steps=200, num_units=32, num_epochs=100, batch_size=1, learning_rate=0.001, test_ratio=0.1):
+def train_denoising_model(data_loader = dct_dataset, num_steps=200, num_epochs=300, batch_size=16, learning_rate=1e-4, test_ratio=0.15):
+    
+    
+    
     optimizer = optim.Adam(Unet.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()  # 使用均方误差损失
+    optimizer_t = optim.Adam(transformer.parameters(), lr=1e-4)
+    optimizer_td = optim.Adam(transformer_dual.parameters(), lr=1e-4)
+    criterion = nn.MSELoss()
 
-
-
+    os.makedirs('denoised_images', exist_ok=True)
     # 划分数据集
     total_size = len(data_loader.dataset)
     test_size = int(total_size * test_ratio)
@@ -201,9 +391,10 @@ def train_denoising_model(data_loader = dct_dataset, num_steps=200, num_units=32
 
     train_dataset, test_dataset = random_split(data_loader.dataset, [train_size, test_size])
 
-
+    
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,drop_last= True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False,drop_last= True)
+    print('train_loader:',len(train_loader))
 
     for epoch in tqdm(range(num_epochs)):
         total_loss = 0
@@ -211,124 +402,172 @@ def train_denoising_model(data_loader = dct_dataset, num_steps=200, num_units=32
         total_ssim = 0
         total_mse = 0
         Unet.train()
+        transformer.train()
+        transformer_dual.train()
+        autoencoder.eval()
         # 训练阶段
-        for k, (inputs, labels) in tqdm(enumerate(train_loader)):
-            inputs = inputs.to(device)  # 将输入数据移动到设备
-            labels = labels.to(device)  # 将标签移动到设备
-
-            inputs = inputs.permute(0,3,1,2)
-            labels = labels.permute(0,3,1,2)
+        for k, (train_img, train_img_tar, flow_0, flow_1, dct_image, dct_gt) in enumerate(tqdm(train_loader)):
+            dct_image = dct_image.to(device)  # 将输入数据移动到设备
+            dct_gt = dct_gt.to(device)  # 将标签移动到设备
+            train_img = train_img.to(device)  #  [N, H, W, C]
+            train_img_tar = train_img_tar.to(device)
+            flow_0 = flow_0.to(device)
+            flow_1 = flow_1.to(device)
+            dct_image = dct_image.permute(0,3,1,2)
+            dct_gt = dct_gt.permute(0,3,1,2)
             optimizer.zero_grad()
+            
 
             # 1. 前向加噪
 
-            t = torch.randint(0, num_steps, (inputs.size(0),), device=device)  # 随机选择时间步
+            t = torch.randint(0, num_steps, (dct_image.size(0),), device=device)  # 随机选择时间步
             # 使用 list comprehension 生成每个 batch 的 mask
-            masks = [torch.tensor(mask_fun(shape=inputs[0].permute(1, 2, 0).shape), dtype=torch.float32, device=device) for _ in
+            masks = [torch.tensor(mask_fun(shape=dct_image[0].shape), dtype=torch.float32, device=device) for _ in
                      range(batch_size)]
 
-
-            # 将多个 mask 堆叠成一个 tensor
+            # 调用函数显示或保存 mask
             masks = torch.stack(masks)
-            # noisy_images = noisy_images.permute(0, 3, 1, 2)
-            masks = masks.permute(0, 3, 1, 2)
 
             # 将 mask 放入 model_kwargs
             model_kwargs = {"mask_c": masks}
 
+            noisy_images_pix, noise_pix = model_.q_sample(train_img, t)
+            noisy_images_dct, noise_dct = model.q_sample(dct_image, t, model_kwargs=model_kwargs)
+            denoised_images_dct = model.sample_loop(model = Unet, shape = noisy_images_dct.shape, model_kwargs=model_kwargs, noise = noisy_images_dct)
+            denoised_images = model_.sample_loop(model = transformer, shape = noisy_images_pix.shape, model_kwargs=model_kwargs, noise = denoised_images_dct)
+            denoised_images_d = dct_to_idct(denoised_images_dct)
+            denoised_images = transformer_dual(denoised_images_d, denoised_images)
 
-            noisy_images, noise = model.q_sample(inputs, t, model_kwargs=model_kwargs)
-            denoised_images = Unet(noisy_images, t, masks, y= labels)
-            # # 2. 计算模型的epsilon和标准差
-            # eps, std = model.p_eps_std(Unet, noisy_images, t, model_kwargs=model_kwargs)
+
+            save_denoised_images(denoised_images, "/root/autodl-tmp/.autodl/outputs", 1, 0)
 
 
-            if (epoch+1) % 10 == 0:
-                print('sample loop:')
-                denoised_images = model.sample_loop(model= Unet, noise=noise, shape=noisy_images.shape, model_kwargs=model_kwargs)
-                torch.save(Unet.state_dict(), f'/root/autodl-tmp/pth/epoch_{epoch+1}.pth')
-            # denoised_images = model.ddim_predictor(Unet, noisy_images, t, model_kwargs=model_kwargs)
 
-            # 4. 计算损失
-            loss = model.training_losses(Unet, inputs, t, model_kwargs=model_kwargs)
-            loss = loss['loss']
-            loss = torch.sum(loss)  # 或者 loss.sum() 取决于你的需求
-            # 将 PyTorch 张量转换为 NumPy 数组
-            # 计算指标
-            psnr_values, ssim_values = compute_metrics(labels, denoised_images)
+            # 2. 计算损失并反向传播
+            loss_dct = model.training_losses(Unet, dct_image, t, model_kwargs=model_kwargs)
+            loss_dct = loss_dct['loss'].sum()
+            train_img_tar = train_img_tar.permute(0,3,1,2)
+            loss_g = criterion(denoised_images, train_img_tar)
+            loss = loss_dct + loss_g
 
-            denoised_images_np = denoised_images.cpu().detach().numpy()
-            images_np = labels.cpu().detach().numpy()
-            # print('image_np: ', images_np.shape)
-            # print('denoised_images_np: ', denoised_images_np.shape)
-            # print("denoised_images_np", denoised_images_np.shape)
-            # print("images_np", images_np.shape)
-            # psnr_val = compare_psnr(denoised_images_np, images_np, data_range=255)  # 计算 PSNR
-            # # ssim_val = compare_ssim(denoised_images_np, images_np, channel_axis=1,data_range = 1.0)
-            # # print(ssim_val)
-            mse_val = compare_mse(images_np, denoised_images_np)
-            print('mse:', mse_val, 'psnr:', psnr_values,'ssimL:',  'loss:', loss.item())
-            total_psnr += psnr_values
-            total_ssim += ssim_values
-            total_mse += mse_val
-            total_loss += loss.item()
-            # 5. 反向传播和优化
             loss.backward()
             optimizer.step()
+            optimizer_t.step()
+            optimizer_td.step()
+
+
+            psnr_values, ssim_values, mse_values = compute_metrics(train_img_tar, denoised_images)
+
+ 
+            print('TRAINING: mse:', sum(mse_values)/len(mse_values), 'psnr:', sum(psnr_values)/len(psnr_values),'ssim:',sum(ssim_values)/len(ssim_values),  'loss:', loss.item())
+            total_psnr += sum(psnr_values)/len(psnr_values)
+            total_ssim += sum(ssim_values)/len(ssim_values)
+            total_mse += sum(mse_values)/len(mse_values)
+            total_loss += loss.item()
+
                         # print(f'eps: {eps}, std: {std} ')
         avg_mse = total_mse / len(train_loader)
-        avg_psnr = total_psnr / len(train_loader.dataset)
-        avg_ssim = total_ssim / len(train_loader.dataset)
-        avg_loss = total_loss / len(train_loader.dataset)
+        avg_psnr = total_psnr / len(train_loader)
+        avg_ssim = total_ssim / len(train_loader)
+        avg_loss = total_loss
         # 输出当前 epoch 的度量结果
         print(f"Trian process: Epoch [{epoch + 1}/{num_epochs}], Loss: {avg_loss:.4f}, MSE: {avg_mse:.4f}, PSNR: {avg_psnr:.4f}, SSIM: {avg_ssim:.4f}")
-        # 确保目标目录存在
-        output_dir = 'weights'
-        os.makedirs(output_dir, exist_ok=True)
 
-        # 然后再保存模型权重
-        torch.save(Unet.state_dict(), f'/root/autodl-tmp/pth/last.pth')
-        # # 在每个 epoch 结束后，保存去噪后的图像
-        # Unet.eval()  # 设置模型为评估模式
-        # # 确保加载的是权重文件的路径
-        #
-        # weight_path = f'weights/last.pth'
-        # Unet.load_state_dict(torch.load(weight_path))
-        #
-        # total_test_loss = 0
-        # total_test_psnr = 0
-        # total_test_ssim = 0
-        # total_test_mse = 0
-        # with torch.no_grad():
-        #     for images in tqdm(test_loader):
-        #         images = images.to(device)  # 将图像移动到设备上
-        #         images = images.permute(0, 3, 1, 2)
-        #
-        #         t = torch.randint(0, num_steps, (images.size(0),), device=device)
-        #         noisy_images, noise = model.q_sample(images, t, model_kwargs = model_kwargs)
-        #         optimizer.zero_grad()
-        #         denoised_images = model.sample_loop(model=Unet, noise=noisy_images, shape=noisy_images.shape, model_kwargs=model_kwargs)
-        #         # denoised_images = model.ddim_predictor(Unet, noisy_images, t, model_kwargs=model_kwargs)
-        #
-        #         #denoised_images = Unet(noisy_images, torch.tensor(t).repeat(images.size(0)).to(device))
-        #
-        #         # 计算测试损失
-        #         loss = criterion(denoised_images, images)  # 计算与原始图像的损失
-        #         total_test_loss += loss.item()
-        #         denoised_images_np = denoised_images.cpu().detach().numpy()
-        #         images_np = images.cpu().numpy()
-        #         psnr_val = compare_psnr(denoised_images_np, images_np, data_range=255)  # 计算 PSNR
-        #         # ssim_val = ssim(denoised_images, images, window_size=11, size_average=True)
-        #         mse_val = compare_mse(images_np, denoised_images_np)  # 计算 SSIM
-        #         total_test_psnr += psnr_val
-        #         # total_test_ssim += ssim_val
-        #         total_test_mse += mse_val
-        # avg_test_mse = total_test_mse / len(test_loader)
-        # avg_test_psnr = total_test_psnr / len(test_loader.dataset)
-        # avg_test_ssim = total_test_ssim / len(test_loader.dataset)
-        # avg_test_loss = total_test_loss / len(test_loader.dataset)
-        # # 输出当前 epoch 的度量结果
-        # print(
-        #     f"test process: Epoch [{epoch + 1}/{num_epochs}], Loss: {avg_test_loss:.4f}, MSE: {avg_test_mse:.4f}, PSNR: {avg_test_psnr:.4f}, SSIM: {avg_test_ssim:.4f}")
+
+        Unet.eval()
+        transformer_dual.eval()
+        transformer.eval()# 设置模型为评估模式
+        
+        total_test_loss = 0
+        total_test_psnr = 0
+        total_test_ssim = 0
+        total_test_mse = 0
+        with torch.no_grad():
+            for k, (train_img, train_img_tar, flow_0, flow_1, dct_image, dct_gt) in enumerate(tqdm(test_loader)):
+                dct_image = dct_image.to(device)  # 将输入数据移动到设备
+                dct_gt = dct_gt.to(device)  # 将标签移动到设备
+                train_img = train_img.to(device)  #  [N, H, W, C]
+                train_img_tar = train_img_tar.to(device)
+                flow_0 = flow_0.to(device)
+                flow_1 = flow_1.to(device)
+                dct_image = dct_image.permute(0,3,1,2)
+                dct_gt = dct_gt.permute(0,3,1,2)
+                optimizer.zero_grad()
+
+                # 1. 前向加噪
+
+                t = torch.randint(0, num_steps, (dct_image.size(0),), device=device)  # 随机选择时间步
+                # 使用 list comprehension 生成每个 batch 的 mask
+                masks = [torch.tensor(mask_fun(shape=dct_image[0].shape), dtype=torch.float32, device=device) for _ in
+                        range(batch_size)]
+
+                # 调用函数显示或保存 mask
+                masks = torch.stack(masks)
+
+                # 将 mask 放入 model_kwargs
+                model_kwargs = {"mask_c": masks}
+                visualize_mask(masks, idx=0, save_path="/root/autodl-tmp/.autodl/outputs/mask.png")  # 保存 mask
+
+                #transform optical featuremaps to pixel space
+                image = transformer(train_img, flow_0, flow_1)
+                image = image.reshape(train_img.shape)
+                image = image.permute(0, 3, 1, 2)
+                save_denoised_images(image, "/root/autodl-tmp/.autodl/outputs", 0, 1)
+                noisy_images_pix, noise_pix = model_.q_sample(image, t)
+                noisy_images_dct, noise_dct = model.q_sample(dct_image, t, model_kwargs=model_kwargs)
+                N_dct = Unet(noisy_images_dct, model._scale_timesteps(t), masks)
+                N_pix = Unet(noisy_images_pix, model_._scale_timesteps(t), masks)
+                N_dct = dct_to_idct(N_dct).to(device)
+                N_dct = N_dct.permute(0, 2, 3, 1)
+                N_pix = N_pix.permute(0, 2, 3, 1)
+                N = transformer_dual(N_pix, N_dct)
+                N = N.reshape(noisy_images_pix.shape)
+                # 3. 去噪
+       
+                # denoised_images = model_.sample_loop(model = Unet, shape = noisy_images_pix.shape, model_kwargs=model_kwargs, noise = noisy_images_pix, dct_noise = noisy_images_dct)
+
+                # noisy images sub noise             \
+                    # #method 1
+
+                # denoised_images = _extract_into_tensor(model_.recip_bar_alphas, t, noisy_images_pix.shape) * \
+                #             (noisy_images_pix - _extract_into_tensor(model_.bar_betas, t, noisy_images_pix.shape) * N)  #method 2
+
+                
+                # loss_dct = model.training_losses(Unet, dct_image, t, model_kwargs=model_kwargs)
+                # loss_dct = loss_dct['loss'].mean()
+                # train_img_tar = train_img_tar.permute(0,3,1,2)
+
+                # loss_s = criterion(N, noise_pix)
+                # loss = loss_dct + loss_s
+                # 计算测试损失
+                train_img_tar = train_img_tar.perumte(0,3,1,2)
+                psnr_values, ssim_values, mse_values = compute_metrics(train_img_tar, denoised_images)
+
+                save_denoised_images(denoised_images, "/root/autodl-tmp/.autodl/outputs", 1, 1)
+                print('EVALUATING: mse:', sum(mse_values)/len(mse_values), 'psnr:', sum(psnr_values)/len(psnr_values),'ssim:',sum(ssim_values)/len(ssim_values),  'loss:', loss.item())
+                total_test_psnr += sum(psnr_values)/len(psnr_values)
+                total_test_ssim += sum(ssim_values)/len(ssim_values)
+                total_test_mse += sum(mse_values)/len(mse_values)
+                total_test_loss += loss.item()
+        avg_test_mse = total_test_mse / len(test_loader)
+        avg_test_psnr = total_test_psnr / len(test_loader)
+        avg_test_ssim = total_test_ssim / len(test_loader)
+        avg_test_loss = total_test_loss
+        # 输出当前 epoch 的度量结果
+        print(
+            f"val process: Epoch [{epoch + 1}/{num_epochs}], Loss: {avg_test_loss:.4f}, MSE: {avg_test_mse:.4f}, PSNR: {avg_test_psnr:.4f}, SSIM: {avg_test_ssim:.4f}")
+                # 将指标保存到txt文件
+        with open("/root/autodl-tmp/.autodl/dataset1-70/Unet/validation_metrics.txt", "a") as file:
+            file.write(f'Epoch [{epoch+1}/{num_epochs}], Validation Loss: {total_test_loss:.4f}, SSIM: {avg_test_ssim:.4f}, PSNR: {avg_test_psnr:.4f}, MSE: {avg_test_mse}\n')
+
+        #   # 保存模型权重
+        weight_path = f"/root/autodl-tmp/.autodl/dataset1-70/Unet/Unet_last.pth"
+        weight_path_t = f"/root/autodl-tmp/.autodl/dataset1-70/transformer/transformer_last.pth"
+        weight_path_d = f"/root/autodl-tmp/.autodl/dataset1-70/Unet/dual_last.pth"
+        torch.save(Unet.state_dict(), weight_path)
+        torch.save(transformer.state_dict(), weight_path_t)
+        torch.save(transformer_dual.state_dict(), weight_path_d)
+        print(f"Model weights saved at {weight_path}")
+
 
 train_denoising_model()
